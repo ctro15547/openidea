@@ -35,7 +35,7 @@ jobs:
       - uses: Swatinem/rust-cache@v2
 
       - name: Build app (aarch64)
-        run: pnpm tauri build --target aarch64-apple-darwin --config '{"bundle":{"createUpdaterArtifacts":false}}'
+        run: pnpm tauri build --target aarch64-apple-darwin --config src-tauri/tauri.no-updater.json
         env:
           MACOSX_DEPLOYMENT_TARGET: 11.0
 
@@ -68,7 +68,7 @@ jobs:
       - uses: Swatinem/rust-cache@v2
 
       - name: Build app (x64)
-        run: pnpm tauri build --target x86_64-pc-windows-msvc --config '{"bundle":{"createUpdaterArtifacts":false}}'
+        run: pnpm tauri build --target x86_64-pc-windows-msvc --config src-tauri/tauri.no-updater.json
 
       - name: Upload installers
         uses: actions/upload-artifact@v4
