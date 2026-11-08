@@ -35,7 +35,7 @@ jobs:
       - uses: Swatinem/rust-cache@v2
 
       - name: Build app (aarch64)
-        run: pnpm tauri build --target aarch64-apple-darwin
+        run: pnpm tauri build --target aarch64-apple-darwin --config '{"bundle":{"createUpdaterArtifacts":false}}'
         env:
           MACOSX_DEPLOYMENT_TARGET: 11.0
 
