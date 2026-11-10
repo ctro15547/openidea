@@ -31,7 +31,11 @@
         const message = String(reason);
         return reason.stack.includes(message) ? reason.stack : `${message}\n${reason.stack}`;
       }
-      return (typeof reason === "string" ? reason : JSON.stringify(reason)) || String(reason);
+      // An Error (or DOMException) without a stack serializes to "{}"; prefer String(),
+      // which at least names the error type, over an empty object.
+      const json = typeof reason === "string" ? reason : JSON.stringify(reason);
+      if (!json || json === "{}") return String(reason);
+      return json;
     } catch {
       return "Unknown startup error";
     }

@@ -588,17 +588,24 @@ export function installLaunchHandling(): () => void {
   if (!isTauri()) return () => {};
   let disposed = false;
   let unlisten: (() => void) | undefined;
-  const launch = import("@tauri-apps/api/webviewWindow").then(async ({ getCurrentWebviewWindow }) => {
-    const off = await getCurrentWebviewWindow().listen(LAUNCH_EVENT, () => {
-      if (!disposed) void consumeLaunch().catch(console.warn);
-    });
-    if (disposed) off();
-    else {
-      unlisten = off;
-      // Subscribe before taking pending files so launches during startup aren't missed.
+  const launch = import("@tauri-apps/api/webviewWindow")
+    .then(async ({ getCurrentWebviewWindow }) => {
+      const off = await getCurrentWebviewWindow().listen(LAUNCH_EVENT, () => {
+        if (!disposed) void consumeLaunch().catch(console.warn);
+      });
+      if (disposed) off();
+      else {
+        unlisten = off;
+        // Subscribe before taking pending files so launches during startup aren't missed.
+        await consumeLaunch();
+      }
+    })
+    .catch(async (e) => {
+      // Older WebKit (macOS 12) can fail this dynamic import with "Load failed"; opening
+      // the pending launch must not depend on the listener being in place.
+      console.warn("launch event listener unavailable, taking the pending launch directly", e);
       await consumeLaunch();
-    }
-  });
+    });
   provideStartupLaunch(launch);
   holdSplash(launch);
   return () => {
