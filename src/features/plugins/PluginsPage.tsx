@@ -31,7 +31,7 @@ import {
   type MenuItem,
   T,
 } from "@/ui";
-import { RISK_LABEL, sortByRisk } from "./consent";
+import { RISK_LABEL, sortByRisk, capabilityDescription } from "./consent";
 import { pluginIconName } from "./pluginIcon";
 import { localizeContributions, usePluginCatalogs, usePluginT } from "./pluginText";
 import { itemsOf, uiPoint } from "./projection";
@@ -49,15 +49,19 @@ import {
   reloadPlugin,
   setAllInstalledEnabled,
   setPluginCapability,
+  revokePluginNetHost,
   setPluginEnabled,
   uninstallPlugin,
   updateAllPlugins,
   usePlugins,
 } from "./store";
 import { useProject } from "@/platform/project";
+import { openExternalUrl } from "@/platform/openUrl";
 import { importIntellijTheme, showInstalledIntellijThemes } from "./intellijImport";
 import { promptInput } from "@/workbench/inputDialogs";
 import styles from "./PluginsPage.module.css";
+import { pluginsBackend } from "./backend";
+import { confirm } from "@/workbench/messages";
 import { tx } from "@/platform/i18n";
 
 const STATUS: Record<PluginStatus, { label: string; tone: "success" | "accent" | "neutral" | "danger" | "warning" }> = {
@@ -292,19 +296,88 @@ function PointSection({ plugin, point }: { plugin: PluginInfo; point: string }) 
   );
 }
 
-function CapabilityRow({ cap, children }: { cap: CapabilityInfo; children?: ReactNode }) {
+function CapabilityRow({ cap, children, program }: { cap: CapabilityInfo; children?: ReactNode; program?: ReactNode }) {
   return (
-    <li className={styles.item}>
-      {children}
-      <span className={styles.itemMain}>{tx(cap.description)}</span>
-      <span className={styles.mono}>{cap.id}</span>
-      <Badge tone={RISK_LABEL[cap.risk].tone}>{RISK_LABEL[cap.risk].label}</Badge>
+    <li className={styles.capabilityItem}>
+      <div className={styles.capabilityHeader}>
+        {children}
+        <span className={styles.mono}>{cap.id}</span>
+        <Badge tone={RISK_LABEL[cap.risk].tone}>{RISK_LABEL[cap.risk].label}</Badge>
+      </div>
+      <p className={styles.capabilityDescription}>{capabilityDescription(cap)}</p>
+      {program}
     </li>
   );
 }
 
+function ProgramPermission({ plugin, cap, disabled }: { plugin: PluginInfo; cap: CapabilityInfo; disabled: boolean }) {
+  const project = useProject((s) => s.project);
+  const [scope, setScope] = useState<"global" | "project">("global");
+  const [path, setPath] = useState("");
+  const [error, setError] = useState("");
+  const [working, setWorking] = useState(false);
+  useEffect(() => {
+    let live = true;
+    void pluginsBackend()
+      .program(plugin.id, cap.id.slice(8), scope)
+      .then((p) => {
+        if (live) setPath(p);
+      })
+      .catch(() => {
+        if (live) setPath("");
+      });
+    return () => {
+      live = false;
+    };
+  }, [plugin, cap.id, scope, working]);
+  const choose = async (reset: boolean) => {
+    setError("");
+    setWorking(true);
+    try {
+      const selected = reset ? null : await pluginsBackend().pickProgram();
+      if (!reset && !selected) return;
+      const message = reset
+        ? tx("Revalidate the default executable? If it is unavailable, this permission will be revoked.")
+        : tx`Allow ${plugin.name} to run ${selected}? This is equivalent to running arbitrary code on this machine.`;
+      if (!(await confirm({ title: tx("Approve plugin executable"), message, ok: tx("Allow"), icon: "warning" })))
+        return;
+      await pluginsBackend().chooseProgram(plugin.id, cap.id, scope, selected);
+      await refreshPlugins();
+    } catch (e) {
+      setError(e instanceof Error ? e.message : String(e));
+    } finally {
+      setWorking(false);
+    }
+  };
+  return (
+    <div className={styles.programPermission}>
+      {path && <span className={clsx(styles.mono, styles.programPath)}>{path}</span>}
+      <Select
+        aria-label={tx("Executable scope")}
+        value={scope}
+        onChange={(value) => setScope(value as "global" | "project")}
+        options={[
+          { value: "global", label: tx("Global") },
+          ...(project ? [{ value: "project", label: tx("Project") }] : []),
+        ]}
+      />
+      <Button disabled={disabled || working} onClick={() => void choose(false)}>
+        {tx("Choose executable…")}
+      </Button>
+      <Button disabled={disabled || working} onClick={() => void choose(true)}>
+        {tx("Reset executable")}
+      </Button>
+      {error && (
+        <span role="alert" className={styles.error}>
+          {error}
+        </span>
+      )}
+    </div>
+  );
+}
+
 function CapabilityList({ plugin, busy }: { plugin: PluginInfo; busy: boolean }) {
-  if (plugin.capabilities.length === 0) {
+  if (plugin.capabilities.length === 0 && plugin.netHosts.length === 0) {
     return (
       <div className={styles.muted}>
         <T>No special permissions.</T>
@@ -315,7 +388,13 @@ function CapabilityList({ plugin, busy }: { plugin: PluginInfo; busy: boolean })
   return (
     <ul className={styles.items} aria-label={tx("Permissions")}>
       {sortByRisk(plugin.capabilities).map((c) => (
-        <CapabilityRow key={c.id} cap={c}>
+        <CapabilityRow
+          key={c.id}
+          cap={c}
+          program={
+            c.id.startsWith("process:") && <ProgramPermission plugin={plugin} cap={c} disabled={busy || !confirmed} />
+          }
+        >
           <Checkbox
             checked={c.granted}
             disabled={busy || !confirmed}
@@ -324,7 +403,58 @@ function CapabilityList({ plugin, busy }: { plugin: PluginInfo; busy: boolean })
           />
         </CapabilityRow>
       ))}
+      {plugin.netHosts.map((host) => (
+        <NetHostRow key={host} plugin={plugin} host={host} disabled={busy || !confirmed} />
+      ))}
     </ul>
+  );
+}
+
+/** A host the user allowed through `net:ask` ("always"); removing it asks again next time. */
+function NetHostRow({ plugin, host, disabled }: { plugin: PluginInfo; host: string; disabled: boolean }) {
+  return (
+    <li className={styles.capabilityItem}>
+      <div className={styles.capabilityHeader}>
+        <span className={styles.mono}>{`net:${host}`}</span>
+        <Badge tone={RISK_LABEL.medium.tone}>{RISK_LABEL.medium.label}</Badge>
+      </div>
+      <p className={styles.capabilityDescription}>
+        {tx("Allowed when the plugin asked at first use. Remove it to be asked again.")}
+      </p>
+      <div className={styles.programPermission}>
+        <Button disabled={disabled} onClick={() => void revokePluginNetHost(plugin.id, host)}>
+          {tx("Remove")}
+        </Button>
+      </div>
+    </li>
+  );
+}
+
+function Homepage({ value }: { value: string }) {
+  let isWebUrl = false;
+  try {
+    const { protocol } = new URL(value);
+    isWebUrl = protocol === "http:" || protocol === "https:";
+  } catch {
+    // Malformed manifest values remain readable as plain text.
+  }
+  return (
+    <dd className={clsx(styles.mono, styles.homepage)}>
+      {isWebUrl ? (
+        <a
+          href={value}
+          className={styles.homepageLink}
+          onClick={(event) => {
+            event.preventDefault();
+            void openExternalUrl(value);
+          }}
+        >
+          {value}
+        </a>
+      ) : (
+        value
+      )}
+    </dd>
   );
 }
 
@@ -362,7 +492,7 @@ function InstalledDetails({ plugin }: { plugin: PluginInfo }) {
             <dt>
               <T>Homepage</T>
             </dt>
-            <dd className={styles.mono}>{plugin.homepage}</dd>
+            <Homepage value={plugin.homepage} />
           </>
         )}
       </dl>
@@ -503,6 +633,14 @@ function CatalogDetails({ entry }: { entry: CatalogPlugin }) {
           <T>Code</T>
         </dt>
         <dd>{entry.hasCode ? tx("WebAssembly component (sandboxed)") : tx("None — contributions only")}</dd>
+        {entry.homepage && (
+          <>
+            <dt>
+              <T>Homepage</T>
+            </dt>
+            <Homepage value={entry.homepage} />
+          </>
+        )}
         {contributes.length > 0 && (
           <>
             <dt>

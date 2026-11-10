@@ -46,7 +46,14 @@ export interface CustomKeymapSettings {
 
 export interface ValidSettings extends WorkflowSettings {
   plugins: Record<string, Record<string, unknown>>;
-  general: { reopenLastProject: boolean; confirmExit: boolean } & GeneralExtras;
+  general: {
+    reopenLastProject: boolean;
+    confirmExit: boolean;
+    /** Last window closes instead of showing the Welcome screen. */
+    closeWithoutWelcome: boolean;
+    /** Closing a window drops its saved editor tabs. */
+    closeTabsWithWindow: boolean;
+  } & GeneralExtras;
   appearance: { theme: ThemeId; accent: string; uiFontSize: number; locale: Locale } & AppearanceExtras;
   editor: {
     fontFamily: string;
@@ -96,6 +103,8 @@ export interface ValidSettings extends WorkflowSettings {
   languageServers: Record<string, LanguageServerEntry>;
   /** Tools › Agents › Chat: the meters in an agent task's header. */
   agents: Required<AgentSettings>;
+  /** Tools › MCP Server (global). */
+  mcpServer: { enabled: boolean };
 }
 
 /** One `languageServers.<name>` entry; every field optional, like in settings.toml. */
@@ -123,7 +132,13 @@ export { ACCENT_PRESETS } from "@/workbench/theme";
 
 export const DEFAULT_SETTINGS: ValidSettings = {
   plugins: {},
-  general: { reopenLastProject: true, confirmExit: true, ...DEFAULT_GENERAL_EXTRAS },
+  general: {
+    reopenLastProject: true,
+    confirmExit: true,
+    closeWithoutWelcome: false,
+    closeTabsWithWindow: false,
+    ...DEFAULT_GENERAL_EXTRAS,
+  },
   appearance: { theme: "light", accent: "#3871e1", uiFontSize: 13, locale: "en", ...DEFAULT_APPEARANCE_EXTRAS },
   editor: {
     fontFamily: "JetBrains Mono",
@@ -164,6 +179,7 @@ export const DEFAULT_SETTINGS: ValidSettings = {
   tools: {},
   languageServers: {},
   agents: { showContextUsage: true, showWorkTime: true, showUsageLimits: true, showCost: false },
+  mcpServer: { enabled: false },
   ...DEFAULT_WORKFLOW,
 };
 
@@ -220,6 +236,8 @@ export function validateSettings(raw: Settings | unknown): ValidSettings {
       ...validateGeneralExtras(g),
       reopenLastProject: bool(g.reopenLastProject, d.general.reopenLastProject),
       confirmExit: bool(g.confirmExit, d.general.confirmExit),
+      closeWithoutWelcome: bool(g.closeWithoutWelcome, d.general.closeWithoutWelcome),
+      closeTabsWithWindow: bool(g.closeTabsWithWindow, d.general.closeTabsWithWindow),
     },
     appearance: {
       ...validateAppearanceExtras(a),
@@ -283,6 +301,7 @@ export function validateSettings(raw: Settings | unknown): ValidSettings {
       showUsageLimits: bool(agents.showUsageLimits, d.agents.showUsageLimits),
       showCost: bool(agents.showCost, d.agents.showCost),
     },
+    mcpServer: { enabled: bool(obj(root.mcpServer).enabled, d.mcpServer.enabled) },
     ...validateWorkflow(root),
   };
 }

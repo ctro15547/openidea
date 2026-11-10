@@ -16,10 +16,13 @@
 //! projects) and folders linked with `openidea-plugin link` (`links.json`).
 
 mod api;
+mod auth;
 pub mod commit;
+mod database;
 pub(crate) mod diagnostics;
 pub mod endpoints;
 mod event_paths;
+mod execution;
 mod files_changed;
 mod hover;
 mod icon_extensions;
@@ -27,17 +30,23 @@ mod icon_patterns;
 mod icon_settings;
 mod icons;
 pub mod index_ops;
+pub(crate) mod injections;
 mod inlay_hints;
 mod install;
 pub mod intellij;
+mod ipc;
+pub mod language_features;
 mod market;
+mod mcp;
 pub mod navigation;
 mod points;
 mod providers;
 pub mod remote;
 pub mod remote_host;
 mod run_detectors;
+pub mod run_targets;
 mod semantic_tokens;
+mod snippets;
 mod theme;
 mod types;
 pub mod ui_points;
@@ -134,6 +143,8 @@ struct Meta {
     retry_at: Option<Instant>,
     /// The component exports `syntax-provider` (known once activated).
     has_syntax: bool,
+    /// Known before activation can publish target registrations.
+    has_run_target_validation: bool,
     /// Next `on-schedule` activation.
     next_schedule: Option<Instant>,
     /// The trusted publisher of a signed installed package.
@@ -155,6 +166,7 @@ impl Meta {
             failures: 0,
             retry_at: None,
             has_syntax: false,
+            has_run_target_validation: false,
             publisher: None,
             next_schedule: None,
         }
@@ -368,7 +380,7 @@ pub struct PluginHost {
     diagnostic_projects: Mutex<Vec<diagnostics::ProjectState>>,
     /// Validated UI declarations of installed packages (start-up reuses them).
     index: Arc<ContributionIndex>,
-    ledger: Mutex<Ledger>,
+    ledger: Arc<Mutex<Ledger>>,
     plugins: RwLock<BTreeMap<String, Arc<LoadedPlugin>>>,
     state: Mutex<PersistedState>,
     /// What every plugin's [`api::PluginApi`] shares: sink, registry,
@@ -410,6 +422,11 @@ struct PendingUpdate {
 }
 
 impl PluginHost {
+    /// Current decoration snapshots for windows opening after a plugin published them.
+    pub fn decoration_sets(&self) -> std::collections::BTreeMap<String, Vec<DecorationSet>> {
+        self.shared.decoration_sets()
+    }
+
     /// Creates the host; call [`load_all`](Self::load_all) to load installed plugins.
     pub fn new(plugins_dir: PathBuf, sink: Arc<dyn PluginEventSink>, limits: Limits) -> IdeResult<Self> {
         std::fs::create_dir_all(&plugins_dir)?;
@@ -435,7 +452,9 @@ impl PluginHost {
         languages.set_process_policy(Arc::new(move |plugin, cap| {
             policy_pins.read().get(&(plugin.to_owned(), cap.to_string())).cloned()
         }));
-        let shared = api::Shared::new(sink.clone(), plugins_dir.join(".data"), pins.clone(), ui.clone());
+        let ledger = Arc::new(Mutex::new(Ledger::load(&plugins_dir)));
+        let shared =
+            api::Shared::new(sink.clone(), plugins_dir.join(".data"), pins.clone(), ui.clone(), ledger.clone());
         let official_keys = market::built_in_official_keys();
         let market = RwLock::new(Self::load_market_index(&plugins_dir, &official_keys));
         let host = Self {
@@ -446,7 +465,7 @@ impl PluginHost {
             updates: Mutex::default(),
             project_policy: RwLock::new(Arc::new(|_| false)),
             engine: PluginEngine::new().map_err(IdeError::internal)?,
-            ledger: Mutex::new(Ledger::load(&plugins_dir)),
+            ledger,
             plugins_dir,
             sink,
             limits,
@@ -653,6 +672,7 @@ impl PluginHost {
 
     /// Unloads the project plugins of `root` (the project became untrusted or closed).
     pub fn restrict_project(&self, root: &Path) {
+        self.shared.withdraw_run_targets(None, Some(root));
         let _guard = self.lifecycle.lock();
         let ids: Vec<_> = self
             .plugins
@@ -786,6 +806,11 @@ impl PluginHost {
             return Err(IdeError::unavailable(format!("plugin {id:?} is not enabled")));
         }
         Ok(self.ui.assets_with_prefix(id, prefix).into_iter().map(|(k, v)| (k, v.to_string())).collect())
+    }
+
+    /// Keeps hosts allowed through `net:ask` in memory for this host's lifetime.
+    pub fn set_net_hosts_session_only(&self) {
+        self.shared.net_hosts_session_only.store(true, std::sync::atomic::Ordering::Relaxed);
     }
 
     /// The UI language windows run in, as `locale()` reports it to plugin code.
@@ -1061,26 +1086,48 @@ impl PluginHost {
         self.info_of(id)
     }
 
-    /// Grants or revokes one capability (Settings › Plugins › Permissions).
+    /// Revokes one exact host remembered through `net:ask`.
+    pub fn revoke_net_host(&self, id: &str, host: &str) -> IdeResult<PluginInfo> {
+        let _guard = self.lifecycle.lock();
+        let plugin = self.get(id)?;
+        self.check_not_uninstalling(&plugin)?;
+        {
+            let mut ledger = self.ledger.lock();
+            if !ledger.forget_net_host(&plugin.subject(), host) {
+                return Err(IdeError::invalid("host is not remembered for this plugin"));
+            }
+            self.save_ledger(&ledger);
+        }
+        self.stop(&plugin);
+        if !self.state.lock().disabled.contains(id) {
+            self.start(&plugin);
+        }
+        self.changed();
+        self.info_of(id)
+    }
+
+    /// Grants or revokes one declared capability (Settings › Plugins › Permissions).
     /// Revoking a required one stops the plugin until consent is given again.
     pub fn set_capability(&self, id: &str, capability: &str, granted: bool) -> IdeResult<PluginInfo> {
         let _guard = self.lifecycle.lock();
         let plugin = self.get(id)?;
         self.check_not_uninstalling(&plugin)?;
         let cap: Capability = capability.parse().map_err(IdeError::invalid)?;
-        if !plugin.manifest().declares(&cap) && !plugin.meta.lock().declared_extra.contains(&cap) {
-            return Err(IdeError::invalid(format!("plugin {id:?} does not declare {cap}")));
-        }
         {
             let mut ledger = self.ledger.lock();
             let subject = plugin.subject();
+            if !plugin.manifest().declares(&cap) && !plugin.meta.lock().declared_extra.contains(&cap) {
+                return Err(IdeError::invalid(format!("plugin {id:?} does not declare {cap}")));
+            }
             if ledger.get(&subject).is_none() {
                 return Err(IdeError::invalid(format!("plugin {id:?} has not been confirmed yet")));
             }
             ledger.set(&subject, &cap, granted);
             if granted
                 && let Capability::Process(program) = &cap
-                && let Some(bin) = self.resolve_binary(program)
+                && let Some(bin) = ledger
+                    .program_choice(&subject, &cap)
+                    .map_or_else(|| self.resolve_binary(program), |path| ledger::approve_program(path).ok())
             {
                 ledger.set_binary(&subject, &cap, bin);
             }
@@ -1097,12 +1144,72 @@ impl PluginHost {
     /// The program a `process:` grant allows, checked against the file
     /// approved for it. Errors ask the user to confirm again.
     pub fn program_for(&self, id: &str, program: &str) -> IdeResult<PathBuf> {
+        self.program_for_project(id, program, None)
+    }
+
+    /// Resolves the approved executable for the invoking project, verifying its pinned content.
+    pub fn program_for_project(&self, id: &str, program: &str, root: Option<&Path>) -> IdeResult<PathBuf> {
         let plugin = self.get(id)?;
-        let cap = Capability::Process(program.to_owned());
         self.ledger
             .lock()
-            .check_binary(&plugin.subject(), &cap)
+            .check_binary_in_project(&plugin.subject(), &Capability::Process(program.into()), root)
             .map_err(|e| IdeError::new(ide_core::error::ErrorKind::PermissionDenied, e))
+    }
+
+    /// Records a user-approved executable choice; removing it revalidates the fallback or revokes the grant.
+    pub fn choose_program(
+        &self,
+        id: &str,
+        capability: &str,
+        root: Option<&Path>,
+        path: Option<&Path>,
+    ) -> IdeResult<PluginInfo> {
+        let _guard = self.lifecycle.lock();
+        let plugin = self.get(id)?;
+        self.check_not_uninstalling(&plugin)?;
+        let cap: Capability = capability.parse().map_err(IdeError::invalid)?;
+        let Capability::Process(program) = &cap else {
+            return Err(IdeError::invalid("expected a process capability"));
+        };
+        if !plugin.manifest().declares(&cap) && !plugin.meta.lock().declared_extra.contains(&cap) {
+            return Err(IdeError::invalid("undeclared process capability"));
+        }
+        let binary = if let Some(path) = path {
+            Some(ledger::approve_program(path).map_err(IdeError::invalid)?)
+        } else if root.is_none() {
+            self.resolve_binary(program)
+        } else {
+            None
+        };
+        {
+            let mut ledger = self.ledger.lock();
+            let subject = plugin.subject();
+            if ledger.get(&subject).is_none() {
+                return Err(IdeError::invalid("confirm this plugin's permissions first"));
+            }
+            if let Some(root) = root {
+                ledger.set_project_binary(&subject, &cap, root, binary);
+                if path.is_some() {
+                    ledger.set(&subject, &cap, true);
+                } else if ledger.check_binary(&subject, &cap).is_err() {
+                    ledger.set(&subject, &cap, false);
+                }
+            } else if let Some(binary) = binary {
+                ledger.set_program_choice(&subject, &cap, path);
+                ledger.set(&subject, &cap, true);
+                ledger.set_binary(&subject, &cap, binary);
+            } else {
+                ledger.set_program_choice(&subject, &cap, None);
+                ledger.set(&subject, &cap, false);
+            }
+            self.save_ledger(&ledger);
+        }
+        self.stop(&plugin);
+        if !self.state.lock().disabled.contains(id) {
+            self.start(&plugin);
+        }
+        self.changed();
+        self.info_of(id)
     }
 
     fn check_uninstall_pending(&self, id: &str) -> IdeResult<()> {
@@ -1151,6 +1258,7 @@ impl PluginHost {
         }
         self.stop(&plugin);
         let cleanup = || -> std::io::Result<()> {
+            self.remove_database_sources(id).map_err(|e| std::io::Error::other(e.message))?;
             install::check_cleanup_parent(&self.plugins_dir, &self.shared.data_dir.join(id))?;
             install::check_cleanup_parent(&self.plugins_dir, plugin.dir())?;
             install::check_not_symlink(&self.shared.data_dir.join(id))?;
@@ -1343,6 +1451,31 @@ impl PluginHost {
         what: &str,
         f: impl Fn(&mut Runtime, Invocation) -> Result<R, CallError> + Clone + Send + 'static,
     ) -> IdeResult<R> {
+        self.code_call_cancellable(id, invocation, what, None, f)
+    }
+
+    fn code_call_cancellable<R: Send + 'static>(
+        &self,
+        id: &str,
+        invocation: Invocation,
+        what: &str,
+        cancel: Option<&ide_core::CancellationToken>,
+        f: impl Fn(&mut Runtime, Invocation) -> Result<R, CallError> + Clone + Send + 'static,
+    ) -> IdeResult<R> {
+        self.code_call_with_budget(id, invocation, what, cancel, None, f)
+    }
+
+    fn code_call_with_budget<R: Send + 'static>(
+        &self,
+        id: &str,
+        invocation: Invocation,
+        what: &str,
+        cancel: Option<&ide_core::CancellationToken>,
+        budget: Option<Duration>,
+        f: impl Fn(&mut Runtime, Invocation) -> Result<R, CallError> + Clone + Send + 'static,
+    ) -> IdeResult<R> {
+        let deadline = budget.map(|budget| Instant::now() + budget);
+        let fallback = ide_core::CancellationToken::new();
         let plugin = self.get(id)?;
         let client = invocation.client.clone();
         {
@@ -1383,7 +1516,29 @@ impl PluginHost {
             }
             let started = Instant::now();
             let (call, inv) = (f.clone(), invocation.clone());
-            let result = actor.call(None, move |rt| call(rt, inv));
+            let result = match (deadline, cancel) {
+                (Some(deadline), cancel) => actor.call_bounded(
+                    cancel.unwrap_or(&fallback),
+                    Duration::from_millis(50),
+                    deadline.saturating_duration_since(Instant::now()),
+                    move |rt| call(rt, inv),
+                ),
+                (None, Some(cancel)) => {
+                    actor.call_cancellable(cancel, Duration::from_millis(50), move |rt| call(rt, inv))
+                }
+                (None, None) => actor.call(None, move |rt| call(rt, inv)),
+            };
+            if deadline.is_some() && matches!(result, Err(ActorError::SoftTimeout)) {
+                self.reap(&plugin, &actor, client.as_deref());
+                return Err(IdeError::new(
+                    ide_core::error::ErrorKind::TimedOut,
+                    format!("plugin {id:?} timed out while {what}"),
+                ));
+            }
+            if matches!(result, Err(ActorError::Cancelled)) {
+                self.reap(&plugin, &actor, client.as_deref());
+                return Err(IdeError::cancelled());
+            }
             if !matches!(result, Err(ActorError::Stopped | ActorError::SoftTimeout | ActorError::Cancelled)) {
                 let crashed = matches!(result, Err(ActorError::Call(CallError::Trap(_))));
                 // Cancelling or a missing grant is not the plugin failing.
@@ -1457,7 +1612,12 @@ impl PluginHost {
 
     /// Plugins' `runDetectors`, for [`ide_run::set_external_detection`].
     pub fn run_detection(&self) -> Arc<dyn ide_run::ExternalDetection> {
-        Arc::new(run_detectors::PluginRunDetection { store: self.run_detectors.clone(), pins: self.pins.clone() })
+        Arc::new(run_detectors::PluginRunDetection {
+            store: self.run_detectors.clone(),
+            dynamic: self.shared.run_configurations.clone(),
+            pins: self.pins.clone(),
+            project_pins: self.shared.project_pins.clone(),
+        })
     }
 
     /// The syntax of plugin languages, for [`ide_language::set_external_syntax`].
@@ -1513,6 +1673,10 @@ impl PluginHost {
     }
 
     /// Plugin context keys in effect for window `client`: global keys overlaid with its own.
+    pub fn status_snapshot(&self, client: &str) -> Vec<PluginStatusItem> {
+        self.shared.status_snapshot(client)
+    }
+
     pub fn context_keys(&self, client: Option<&str>) -> Vec<PluginContextKey> {
         self.shared.context_keys(client)
     }
@@ -1543,6 +1707,10 @@ impl PluginHost {
 
     /// A window answered a plugin's `CommitRequested`; false when the call no
     /// longer waits.
+    pub fn answer_command(&self, client: &str, request: &str, answer: CommandAnswer) -> bool {
+        request.parse().is_ok_and(|id| self.shared.answer_command(client, id, answer))
+    }
+
     pub fn answer_commit(&self, request_id: &str, answer: CommitAnswer) -> bool {
         request_id.parse().is_ok_and(|id| self.shared.answer_commit(id, answer))
     }
@@ -1632,6 +1800,30 @@ impl PluginHost {
 
     /// Queues workbench events from window `client` for the plugins that want
     /// them; [`flush_events`](Self::flush_events) delivers them in batches.
+    pub fn post_window_events(&self, client: &str, events: Vec<WorkbenchEvent>, editor: Option<PluginEditor>) {
+        let mut editors = self.shared.event_editors.write();
+        if let Some(editor) = editor {
+            editors.insert(client.into(), editor.context());
+        } else {
+            editors.remove(client);
+        }
+        drop(editors);
+        self.post_events(
+            Some(client),
+            events
+                .into_iter()
+                .filter(|e| {
+                    !matches!(
+                        e,
+                        WorkbenchEvent::RunExited(_)
+                            | WorkbenchEvent::TerminalExited(_)
+                            | WorkbenchEvent::ContentTabAction(_)
+                    )
+                })
+                .collect(),
+        );
+    }
+
     pub fn post_events(&self, client: Option<&str>, events: Vec<WorkbenchEvent>) {
         self.post_events_from(client, events, None);
     }
@@ -1661,7 +1853,13 @@ impl PluginHost {
                             .as_ref()
                             .is_none_or(|root| client.and_then(|c| self.shared.project_of(c)).as_ref() == Some(root))
                 })
-                .cloned()
+                .filter_map(|e| match e {
+                    WorkbenchEvent::SettingsChanged(_) => {
+                        let keys = self.shared.changed_settings(&p.pkg, client);
+                        (!keys.is_empty()).then_some(WorkbenchEvent::SettingsChanged(keys))
+                    }
+                    _ => Some(e.clone()),
+                })
                 .collect();
             let wanted = Self::filter_path_events(&self.shared, &p, client, &wanted, &subs);
             if wanted.is_empty() {
@@ -1682,7 +1880,15 @@ impl PluginHost {
             let excess = queue.events.len().saturating_sub(MAX_QUEUED_EVENTS);
             let mut remaining = excess;
             queue.events.retain(|event| {
-                if remaining > 0 && !matches!(event, WorkbenchEvent::FilesChanged(_)) {
+                if remaining > 0
+                    && !matches!(
+                        event,
+                        WorkbenchEvent::FilesChanged(_)
+                            | WorkbenchEvent::RunExited(_)
+                            | WorkbenchEvent::TerminalExited(_)
+                            | WorkbenchEvent::ContentTabAction(_)
+                    )
+                {
                     remaining -= 1;
                     false
                 } else {
@@ -1809,9 +2015,10 @@ impl PluginHost {
         let invocation = Invocation {
             workspace_root: client.as_deref().and_then(|c| self.shared.project_of(c)),
             client: client.clone(),
-            editor: None,
+            editor: client.as_deref().and_then(|c| self.shared.event_editors.read().get(c).cloned()),
             selected_paths: Vec::new(),
             global_settings: false,
+            command_chain: Vec::new(),
         };
         let kinds: BTreeSet<EventKind> = queue.events.iter().map(WorkbenchEvent::kind).collect();
         let filesystem = kinds.contains(&EventKind::FilesChanged);
@@ -1823,6 +2030,9 @@ impl PluginHost {
             if batches.running.as_ref() == Some(&kinds)
                 && !kinds.contains(&EventKind::Scheduled)
                 && !kinds.contains(&EventKind::FilesChanged)
+                && !kinds.iter().any(|k| {
+                    matches!(k, EventKind::RunExited | EventKind::TerminalExited | EventKind::ContentTabAction)
+                })
             {
                 actor.cancel_soft();
             }
@@ -2354,6 +2564,7 @@ impl PluginHost {
             plugin_id: plugin.id().to_owned(),
             version: plugin.manifest().version.clone(),
             granted,
+            subject: plugin.subject(),
             host: api,
             limits: self.limits,
         };
@@ -2372,6 +2583,7 @@ impl PluginHost {
                 return Err(IdeError::internal(format!("plugin {:?} {e}", plugin.id())));
             }
         };
+        plugin.meta.lock().has_run_target_validation = rt.has_run_target_validation();
         let crash = match rt.activate() {
             Ok(_) => None,
             Err(CallError::Trap(e)) => Some(format!("activation {e}")),
@@ -2599,8 +2811,21 @@ impl PluginHost {
     /// pick up a change on their next lookup.
     fn refresh_pins(&self, ledger: &Ledger) {
         let mut pins = HashMap::new();
+        let mut project_pins = HashMap::new();
         for plugin in self.plugins.read().values() {
             let subject = plugin.subject();
+            if let Some(grant) = ledger.get(&subject) {
+                for (root, binaries) in &grant.project_binaries {
+                    for (cap, bin) in binaries {
+                        if grant.granted.contains(cap) {
+                            project_pins.insert(
+                                (plugin.id().to_owned(), cap.clone(), root.clone()),
+                                ProgramPin { path: bin.path.clone(), hash: bin.hash.clone() },
+                            );
+                        }
+                    }
+                }
+            }
             let declared =
                 plugin.manifest().capabilities.all().cloned().chain(plugin.meta.lock().declared_extra.clone());
             for cap in declared.filter(|c| matches!(c, Capability::Process(_))) {
@@ -2612,6 +2837,7 @@ impl PluginHost {
                 }
             }
         }
+        *self.shared.project_pins.write() = project_pins;
         let mut current = self.pins.write();
         if *current != pins {
             *current = pins;
@@ -2665,12 +2891,26 @@ impl PluginHost {
 
     fn record_consent(&self, request: &Request<'_>, consent: &Consent) {
         let accepted: Vec<Capability> = request.optional.iter().filter(|c| consent.accepts(c)).cloned().collect();
+        let choices: BTreeMap<_, _> = {
+            let ledger = self.ledger.lock();
+            request
+                .required
+                .iter()
+                .chain(&accepted)
+                .filter_map(|cap| {
+                    ledger.program_choice(&request.subject, cap).map(|p| (cap.to_string(), p.to_path_buf()))
+                })
+                .collect()
+        };
         let binaries: BTreeMap<String, BinaryGrant> = request
             .required
             .iter()
             .chain(&accepted)
             .filter_map(|c| match c {
-                Capability::Process(program) => self.resolve_binary(program).map(|b| (c.to_string(), b)),
+                Capability::Process(program) => choices
+                    .get(&c.to_string())
+                    .map_or_else(|| self.resolve_binary(program), |path| ledger::approve_program(path).ok())
+                    .map(|b| (c.to_string(), b)),
                 _ => None,
             })
             .collect();
@@ -2702,6 +2942,13 @@ impl PluginHost {
                 capabilities.push(CapabilityInfo::new(extra, true, granted(extra)));
             }
         }
+        // Hosts remembered through `net:ask` are grants of their own: listed
+        // separately so the user can revoke them one by one.
+        let net_hosts = grant
+            .as_ref()
+            .filter(|g| g.confirmed && g.has(&Capability::NetAsk) && m.declares(&Capability::NetAsk))
+            .map(|g| g.net_hosts.iter().cloned().collect())
+            .unwrap_or_default();
         PluginInfo {
             id: m.id.clone(),
             name: m.name.clone(),
@@ -2718,6 +2965,7 @@ impl PluginHost {
             error: meta.error.clone(),
             has_code: m.wasm.is_some(),
             capabilities,
+            net_hosts,
             contributions: self.registry.contributions(&m.id),
             activation: m.activation.iter().map(ToString::to_string).collect(),
             warnings: meta.warnings.clone(),
