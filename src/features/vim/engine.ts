@@ -224,6 +224,9 @@ const caret = "var(--caret, var(--fg-strong))";
 const vimTheme = EditorView.theme({
   "& .cm-vimCursorLayer .cm-fat-cursor": {
     background: `color-mix(in srgb, ${caret} 60%, transparent)`,
+    // A crisp silhouette on top of the translucent fill: the fill alone reads
+    // as "the character got brighter" on dark themes, with no visible block.
+    outline: `2px solid ${caret}`,
   },
   "&:not(.cm-focused) .cm-vimCursorLayer .cm-fat-cursor": {
     background: "none",
