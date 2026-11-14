@@ -31,16 +31,11 @@
         outdated:
           "The system's WebKitGTK is too old: OpenIDEA needs a recent WebKitGTK (webkit2gtk-4.1). Update it with your package manager, then open OpenIDEA again.",
       };
-  // The bundle targets Safari 16 (vite.config.ts); an older system web engine can't even
-  // parse it. Container queries came with Safari 16, and WebKit's user agent doesn't name
-  // its version. Unknown (no CSS.supports) counts as current.
-  const outdated = () => {
-    try {
-      return typeof window.CSS?.supports === "function" && !window.CSS.supports("container-type", "inline-size");
-    } catch {
-      return false;
-    }
-  };
+  // Fork: the minimum here is macOS 12, whose system engine (Safari 15) parses the
+  // Safari-16-targeted bundle and drops @container rules harmlessly, so upstream's
+  // macOS 13 engine gate is deliberately skipped; a real startup failure keeps the
+  // generic report hint instead of telling macOS 12 users to upgrade.
+  const outdated = () => false;
   let failed = false;
   let ready = false;
   const describe = (reason) => {
