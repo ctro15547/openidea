@@ -24,7 +24,7 @@ import { replyActions } from "./replyActions";
 import { focusedSession } from "./sessionFocus";
 import styles from "./Session.module.css";
 import chipStyles from "./ReferenceChip.module.css";
-import { textOf, typeIn } from "./composerTesting";
+import { caretOf, textOf, typeIn } from "./composerTesting";
 
 const backend = vi.hoisted(() => ({
   entries: new Map<string, AgentEntry[]>(),
@@ -1564,6 +1564,31 @@ describe("conversation loading", () => {
 });
 
 describe("session state across tasks and hosts", () => {
+  it("updates input focus availability while the task changes status without losing its draft caret", async () => {
+    render(<SessionEditor input={input("A")} />);
+    await screen.findByText("Answer A");
+    const message = screen.getByRole("textbox", { name: "Message" });
+    typeIn(message, "Draft to keep", 3);
+    const conversation = stream();
+    act(() => conversation.focus());
+    act(() =>
+      useAgents.setState((s) => ({
+        tasks: new Map(s.tasks).set("A", { ...s.tasks.get("A")!, status: "archived" }),
+      })),
+    );
+    act(() => focusedSession()?.focusInput?.());
+    expect(conversation).toHaveFocus();
+    act(() =>
+      useAgents.setState((s) => ({
+        tasks: new Map(s.tasks).set("A", { ...s.tasks.get("A")!, status: "running" }),
+      })),
+    );
+    act(() => focusedSession()?.focusInput?.());
+    await waitFor(() => expect(message).toHaveFocus());
+    expect(textOf(message)).toBe("Draft to keep");
+    expect(caretOf(message)).toBe(3);
+  });
+
   it("leaves a task unread while its kept-alive tab is hidden, and reads it once shown", () => {
     vi.spyOn(document, "hasFocus").mockReturnValue(true);
     useAgents.setState({ unread: new Set(["A"]) });
@@ -1790,6 +1815,29 @@ describe("meters in the task header", () => {
     expect(screen.queryByText("24k/200k (12%)")).toBeNull();
     expect(screen.queryByText("5h 19%")).toBeNull();
     expect(screen.getByText("$0.42")).toBeInTheDocument();
+  });
+
+  it("hides the status-bar Terminal button in the local checkout and opens the worktree's terminal otherwise", async () => {
+    const opened: unknown[] = [];
+    const disposeTerminal = registerActions([
+      { id: "terminal.openAt", title: "Open in Terminal", run: ({ arg }) => void opened.push(arg) },
+    ]);
+    try {
+      const view = render(<SessionEditor input={input("A")} />);
+      await screen.findByText("Answer A");
+      expect(screen.queryByRole("button", { name: "Terminal" })).toBeNull();
+
+      act(() =>
+        useAgents.setState({
+          tasks: new Map([["A", { ...task("A"), isolation: "worktree", cwd: "/worktrees/a", branch: "agent/a" }]]),
+        }),
+      );
+      fireEvent.click(screen.getByRole("button", { name: "Terminal" }));
+      expect(opened).toEqual(["/worktrees/a"]);
+      view.unmount();
+    } finally {
+      disposeTerminal();
+    }
   });
 });
 
